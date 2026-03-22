@@ -32,3 +32,6 @@ Thumbs.db
 
 # Claude Code local settings
 .claude/
+android/hs_err_*.log
+android/app/hs_err_*.log
+android/replay_*.log

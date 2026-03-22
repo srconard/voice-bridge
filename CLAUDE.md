@@ -4,22 +4,29 @@ Hands-free voice interface for Claude Code — talk to Claude from your phone (o
 
 ## Project Status
 
-**Phase: v2 — Direct HTTP bridge via custom channel plugin (text chat working)**
+**Phase: v2 — Direct HTTP bridge via custom channel plugin (testing from phone)**
 
 **Project location: `C:\dev\voice-bridge`**
 
 ### What Works
-- Custom "voicebridge" MCP channel plugin (forked from fakechat)
-- React Native app connects to plugin via WebSocket
-- Text input + send: messages go directly into the running Claude Code session
-- Claude's responses appear in the app in real time
-- No Telegram dependency — direct HTTP/WebSocket connection
-- Works over Tailscale for remote/cellular access
+- Custom "voicebridge" MCP channel plugin (forked from fakechat) — **tested, working**
+- Browser debug UI at `http://localhost:8787` — sends messages to Claude Code, receives replies
+- React Native app built with WebSocket transport (BridgeService)
+- Plugin registered in Claude Code plugin system and enabled
+- Windows Firewall rule added for port 8787
+- `android:usesCleartextTraffic="true"` set in AndroidManifest (required for HTTP)
+
+### Current Status: Testing Phone App Connection
+- Browser→Claude works end-to-end
+- Phone app was getting "Network request failed" — fixed cleartext HTTP, rebuilt APK
+- **Need to test**: install latest APK (`G:\My Drive\transfer\voice-bridge-v2.apk`) and connect to `http://192.168.0.127:8787`
+- If it still fails, debug with: phone browser → `http://192.168.0.127:8787` to verify network reachability
 
 ### What's Next
-1. **Voice input** — Android SpeechRecognizer intent (native module) or voice keyboard
-2. **TTS output** — Android native TTS or server-side (OpenAI TTS API)
-3. **BT remote** — pair Bluetooth shutter remote for hands-free activation
+1. **Get phone app working end-to-end** — may need network debugging
+2. **Voice input** — Android SpeechRecognizer intent (native module) or voice keyboard
+3. **TTS output** — Android native TTS or server-side (OpenAI TTS API)
+4. **BT remote** — pair Bluetooth shutter remote for hands-free activation
 
 ### Previous Architecture (v1 — archived)
 The v1 app used Telegram Bot API as transport, which was fundamentally broken:
@@ -72,15 +79,27 @@ The v1 app used Telegram Bot API as transport, which was fundamentally broken:
 
 ## Running the Plugin
 
-```bash
-# Start Claude Code with the voicebridge channel
-claude --channels plugin:voicebridge@local
+The plugin is configured as an MCP server in `C:\dev\voice-bridge\.mcp.json`. To launch:
 
-# Or with the development flag if plugin registration doesn't work:
-# claude --dangerously-load-development-channels server:C:\dev\voice-bridge\plugin
+```bash
+cd C:\dev\voice-bridge
+claude --dangerously-load-development-channels server:voicebridge
 ```
 
-The plugin starts an HTTP + WebSocket server on port 8787 (configurable via `VOICEBRIDGE_PORT` env var). It also serves a debug web UI at the root URL.
+**Important notes:**
+- Must `cd` to `C:\dev\voice-bridge` first — the `.mcp.json` in the project root defines the `voicebridge` server
+- `plugin:voicebridge@local` does NOT work (channel allowlist rejects non-marketplace plugins)
+- `server:voicebridge` requires the `--dangerously-load-development-channels` flag
+- When Claude asks to approve the MCP server, say yes
+- The plugin starts an HTTP + WebSocket server on port 8787 (configurable via `VOICEBRIDGE_PORT` env var)
+- Debug web UI available at `http://localhost:8787`
+
+### Plugin Registration (for reference)
+- Plugin is registered in `~/.claude/plugins/installed_plugins.json` as `voicebridge@local`
+- Plugin is enabled in `~/.claude/settings.json` under `enabledPlugins`
+- `channelsEnabled: true` is set in `~/.claude/settings.json`
+- MCP server defined in `C:\dev\voice-bridge\.mcp.json` (project-level)
+- Plugin source/cache at `~/.claude/plugins/cache/local/voicebridge/0.1.0/`
 
 ## Building the App
 
@@ -102,22 +121,30 @@ export JAVA_HOME="/c/Program Files/Eclipse Adoptium/jdk-17.0.18.8-hotspot"
 - JDK 17 Temurin: `C:\Program Files\Eclipse Adoptium\jdk-17.0.18.8-hotspot`
 - Android SDK 36, Build Tools 36.0.0, NDK 27.1.12297006, CMake 3.22.1
 - Bun runtime (for the channel plugin)
-- `android/gradle.properties`: `org.gradle.java.home` points to JDK 17, `android.enableJetifier=true`
+- `android/gradle.properties`: `org.gradle.java.home` points to JDK 17, `android.enableJetifier=true`, `reactNativeArchitectures=arm64-v8a` (arm64 only to save build memory)
 - `android/build.gradle`: `allprojects` block adds async-storage local Maven repo
-- `android/app/src/main/AndroidManifest.xml`: `tools:replace="android:appComponentFactory"` for AndroidX compat
+- `android/app/src/main/AndroidManifest.xml`: `tools:replace="android:appComponentFactory"` for AndroidX compat, `android:usesCleartextTraffic="true"` for HTTP
+
+### Build Tips
+- **Memory**: Building while a Claude Code channel session is running can cause OOM/JVM crashes. Close the channel session before building.
+- **Lint skip**: If OOM persists, skip lint: `./gradlew assembleRelease -x lintVitalAnalyzeRelease -x lintVitalReportRelease -x lintVitalRelease`
 
 ### Windows Path Length
 Project MUST live at a short path (e.g., `C:\dev\voice-bridge`). Long paths cause ninja build failures due to Windows 260-char limit.
 
-## Networking / Tailscale Setup
+## Networking
 
+### Same-WiFi Testing
+- PC LAN IP: `192.168.0.127` (may change — check with `ipconfig`)
+- App setup screen: `http://192.168.0.127:8787`
+- Windows Firewall rule already added: `name="voicebridge" dir=in action=allow protocol=TCP localport=8787`
+- **Debugging**: try opening `http://192.168.0.127:8787` in the phone's browser first — if the debug UI loads, the network path works
+
+### Tailscale (Remote / Cellular — not yet set up)
 1. Install Tailscale on PC and Android phone, connect to same tailnet
 2. Note the PC's Tailscale IP (100.x.y.z)
 3. The voicebridge plugin binds to `0.0.0.0` — reachable on all interfaces
 4. In the app setup screen, enter `http://100.x.y.z:8787`
-5. Windows Firewall: may need to allow inbound on port 8787
-
-For same-WiFi testing, use the PC's LAN IP instead.
 
 ## Plugin Details
 
