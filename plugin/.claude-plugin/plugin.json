@@ -1,0 +1,5 @@
+{
+  "name": "voicebridge",
+  "description": "Voice Bridge channel — HTTP + WebSocket server for phone-to-Claude communication",
+  "version": "0.1.0"
+}

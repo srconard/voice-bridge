@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+plugin/node_modules/
+
+# React Native / Metro
+.metro-health-check*
+
+# Android build
+android/.gradle/
+android/.kotlin/
+android/app/build/
+android/app/.cxx/
+android/build/
+android/local.properties
+
+# Bun
+plugin/bun.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Claude Code local settings
+.claude/
