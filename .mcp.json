@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "voicebridge": {
-      "command": "bun",
-      "args": ["C:\\dev\\voice-bridge\\plugin\\server.ts"]
-    }
-  }
-}
