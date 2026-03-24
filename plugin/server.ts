@@ -36,8 +36,10 @@ type Msg = {
 type Wire =
   | ({ type: 'msg' } & Msg)
   | { type: 'edit'; id: string; text: string }
+  | { type: 'tts'; replyId: string; audioUrl: string }
 
-const clients = new Set<ServerWebSocket<unknown>>()
+interface ClientState { ttsEnabled: boolean }
+const clients = new Map<ServerWebSocket<unknown>, ClientState>()
 let seq = 0
 
 function nextId() {
@@ -46,14 +48,52 @@ function nextId() {
 
 function broadcast(m: Wire) {
   const data = JSON.stringify(m)
-  for (const ws of clients) if (ws.readyState === 1) ws.send(data)
+  for (const [ws] of clients) if (ws.readyState === 1) ws.send(data)
+}
+
+function broadcastToTTS(m: Wire) {
+  const data = JSON.stringify(m)
+  for (const [ws, state] of clients) {
+    if (ws.readyState === 1 && state.ttsEnabled) ws.send(data)
+  }
+}
+
+// ── ElevenLabs TTS ──
+
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY ?? ''
+let elevenLabsVoiceId = process.env.ELEVENLABS_VOICE_ID ?? '21m00Tcm4TlvDq8ikWAM'
+process.stderr.write(`[voicebridge] ELEVENLABS_VOICE_ID env=${process.env.ELEVENLABS_VOICE_ID}, using=${elevenLabsVoiceId}\n`)
+
+async function generateTTS(text: string, messageId: string): Promise<string> {
+  const res = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${elevenLabsVoiceId}`,
+    {
+      method: 'POST',
+      headers: {
+        'xi-api-key': ELEVENLABS_API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'audio/mpeg',
+      },
+      body: JSON.stringify({
+        text,
+        model_id: 'eleven_multilingual_v2',
+      }),
+    },
+  )
+  if (!res.ok) {
+    throw new Error(`ElevenLabs API error: ${res.status} ${res.statusText}`)
+  }
+  const filename = `${messageId}.mp3`
+  mkdirSync(OUTBOX_DIR, { recursive: true })
+  writeFileSync(join(OUTBOX_DIR, filename), Buffer.from(await res.arrayBuffer()))
+  return filename
 }
 
 function mime(ext: string) {
   const m: Record<string, string> = {
     '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
     '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
-    '.pdf': 'application/pdf', '.txt': 'text/plain',
+    '.pdf': 'application/pdf', '.txt': 'text/plain', '.mp3': 'audio/mpeg',
   }
   return m[ext] ?? 'application/octet-stream'
 }
@@ -117,6 +157,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const id = nextId()
         broadcast({ type: 'msg', id, from: 'assistant', text, ts: Date.now(), replyTo, file })
         ids.push(id)
+
+        // Fire-and-forget TTS generation
+        const anyWantsTTS = [...clients.values()].some(s => s.ttsEnabled)
+        if (anyWantsTTS && ELEVENLABS_API_KEY) {
+          generateTTS(text, id).then(filename => {
+            broadcastToTTS({ type: 'tts', replyId: id, audioUrl: `/files/${filename}` })
+          }).catch(err => {
+            process.stderr.write(`TTS error: ${err}\n`)
+          })
+        }
+
         return { content: [{ type: 'text', text: `sent (${ids.join(', ')})` }] }
       }
       case 'edit_message': {
@@ -158,7 +209,7 @@ Bun.serve({
     }
 
     if (url.pathname === '/health') {
-      return new Response(JSON.stringify({ status: 'ok', clients: clients.size }), {
+      return new Response(JSON.stringify({ status: 'ok', clients: clients.size, voiceId: elevenLabsVoiceId, envVoiceId: process.env.ELEVENLABS_VOICE_ID ?? 'unset' }), {
         headers: { 'content-type': 'application/json' },
       })
     }
@@ -195,17 +246,42 @@ Bun.serve({
       })()
     }
 
+    if (url.pathname === '/voice' && req.method === 'GET') {
+      return new Response(JSON.stringify({ voiceId: elevenLabsVoiceId }), {
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+
+    if (url.pathname.startsWith('/voice/') && req.method === 'POST') {
+      elevenLabsVoiceId = url.pathname.slice(7)
+      process.stderr.write(`Voice changed to: ${elevenLabsVoiceId}\n`)
+      return new Response(JSON.stringify({ voiceId: elevenLabsVoiceId }), {
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+
     if (url.pathname === '/') {
       return new Response(HTML, { headers: { 'content-type': 'text/html; charset=utf-8' } })
     }
     return new Response('404', { status: 404 })
   },
   websocket: {
-    open: ws => { clients.add(ws) },
+    open: ws => { clients.set(ws, { ttsEnabled: false }) },
     close: ws => { clients.delete(ws) },
-    message: (_, raw) => {
+    message: (ws, raw) => {
       try {
-        const { id, text } = JSON.parse(String(raw)) as { id: string; text: string }
+        const data = JSON.parse(String(raw)) as Record<string, unknown>
+        if (data.type === 'tts_config') {
+          const state = clients.get(ws)
+          if (state) state.ttsEnabled = !!data.enabled
+          return
+        }
+        if (data.type === 'set_voice' && typeof data.voiceId === 'string') {
+          elevenLabsVoiceId = data.voiceId
+          process.stderr.write(`Voice changed to: ${elevenLabsVoiceId}\n`)
+          return
+        }
+        const { id, text } = data as { id: string; text: string }
         if (id && text?.trim()) deliver(id, text.trim())
       } catch {}
     },

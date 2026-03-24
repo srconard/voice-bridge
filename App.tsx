@@ -26,6 +26,7 @@ import Voice, {
 } from '@react-native-voice/voice';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BridgeService } from './src/services/bridge';
+import { TTSService } from './src/services/tts';
 
 // ─────────────────────────────────────────────────────
 // Types
@@ -46,6 +47,7 @@ interface ConversationEntry {
 const STORAGE_KEYS = {
   SERVER_URL: '@cvb_server_url',
   SETUP_COMPLETE: '@cvb_setup_complete',
+  TTS_ENABLED: '@cvb_tts_enabled',
 };
 
 // ─────────────────────────────────────────────────────
@@ -77,6 +79,11 @@ const AppContent: React.FC = () => {
   const accumulatedText = useRef('');
   const partialRef = useRef('');
   const stoppingRef = useRef(false);
+
+  // TTS
+  const [ttsEnabled, setTtsEnabled] = useState(false);
+  const ttsEnabledRef = useRef(false);
+  const ttsServiceRef = useRef<TTSService | null>(null);
 
   // Refs
   const bridgeRef = useRef<BridgeService | null>(null);
@@ -223,12 +230,17 @@ const AppContent: React.FC = () => {
   useEffect(() => {
     (async () => {
       try {
-        const [url, setupDone] = await Promise.all([
+        const [url, setupDone, ttsStored] = await Promise.all([
           AsyncStorage.getItem(STORAGE_KEYS.SERVER_URL),
           AsyncStorage.getItem(STORAGE_KEYS.SETUP_COMPLETE),
+          AsyncStorage.getItem(STORAGE_KEYS.TTS_ENABLED),
         ]);
 
         if (url) setServerUrl(url);
+        if (ttsStored === 'true') {
+          setTtsEnabled(true);
+          ttsEnabledRef.current = true;
+        }
 
         if (setupDone === 'true' && url) {
           await initServices(url);
@@ -242,6 +254,7 @@ const AppContent: React.FC = () => {
 
     return () => {
       bridgeRef.current?.destroy();
+      ttsServiceRef.current?.destroy();
     };
   }, []);
 
@@ -253,10 +266,20 @@ const AppContent: React.FC = () => {
     const bridge = new BridgeService({ serverUrl: url });
     bridgeRef.current = bridge;
 
+    const tts = new TTSService();
+    ttsServiceRef.current = tts;
+
     bridge.onResponse((text: string) => {
       handleClaudeResponse(text);
     });
 
+    bridge.onTTS((audioUrl: string) => {
+      if (ttsEnabledRef.current) {
+        tts.play(`${url}${audioUrl}`);
+      }
+    });
+
+    bridge.sendTTSConfig(ttsEnabledRef.current);
     bridge.connect();
     setIsConnected(true);
   };
@@ -282,6 +305,17 @@ const AppContent: React.FC = () => {
       Alert.alert('Send Error', String(err));
     }
   };
+
+  const toggleTTS = useCallback(async () => {
+    const next = !ttsEnabled;
+    setTtsEnabled(next);
+    ttsEnabledRef.current = next;
+    bridgeRef.current?.sendTTSConfig(next);
+    await AsyncStorage.setItem(STORAGE_KEYS.TTS_ENABLED, next ? 'true' : 'false');
+    if (!next) {
+      ttsServiceRef.current?.stop();
+    }
+  }, [ttsEnabled]);
 
   const handleClaudeResponse = (text: string) => {
     const entry: ConversationEntry = {
@@ -429,14 +463,22 @@ const AppContent: React.FC = () => {
             {isConnected ? 'Connected' : 'Disconnected'}
           </Text>
         </View>
-        <TouchableOpacity
-          onPress={() => {
-            setScreen('setup');
-            setIsConnected(false);
-            bridgeRef.current?.destroy();
-          }}>
-          <Text style={styles.headerSettings}>⚙</Text>
-        </TouchableOpacity>
+        <View style={styles.headerRight}>
+          <TouchableOpacity onPress={toggleTTS}>
+            <Text style={[styles.headerSettings, ttsEnabled && { color: '#d97706' }]}>
+              {ttsEnabled ? '\uD83D\uDD0A' : '\uD83D\uDD07'}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => {
+              setScreen('setup');
+              setIsConnected(false);
+              bridgeRef.current?.destroy();
+              ttsServiceRef.current?.destroy();
+            }}>
+            <Text style={styles.headerSettings}>⚙</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       {/* Conversation log */}
@@ -643,6 +685,11 @@ const styles = StyleSheet.create({
   headerText: {
     color: '#888',
     fontSize: 13,
+  },
+  headerRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 16,
   },
   headerSettings: {
     color: '#888',

@@ -11,6 +11,8 @@ export class BridgeService {
   private serverUrl: string;
   private ws: WebSocket | null = null;
   private responseCallback: ((text: string) => void) | null = null;
+  private ttsCallback: ((audioUrl: string, replyId: string) => void) | null = null;
+  private pendingTTSConfig: boolean | null = null;
   private seq = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -52,7 +54,10 @@ export class BridgeService {
     const ws = new WebSocket(this.wsUrl());
 
     ws.onopen = () => {
-      // Connected
+      // Send pending TTS config on connect
+      if (this.pendingTTSConfig !== null) {
+        this.sendTTSConfig(this.pendingTTSConfig);
+      }
     };
 
     ws.onmessage = (event: MessageEvent) => {
@@ -60,6 +65,8 @@ export class BridgeService {
         const data = JSON.parse(String(event.data));
         if (data.type === 'msg' && data.from === 'assistant' && data.text) {
           this.responseCallback?.(data.text);
+        } else if (data.type === 'tts' && data.audioUrl) {
+          this.ttsCallback?.(data.audioUrl, data.replyId);
         }
       } catch {
         // Ignore malformed messages
@@ -104,6 +111,23 @@ export class BridgeService {
   }
 
   /**
+   * Register a callback for incoming TTS audio URLs.
+   */
+  onTTS(callback: (audioUrl: string, replyId: string) => void): void {
+    this.ttsCallback = callback;
+  }
+
+  /**
+   * Send TTS enabled/disabled preference to the server.
+   */
+  sendTTSConfig(enabled: boolean): void {
+    this.pendingTTSConfig = enabled;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'tts_config', enabled }));
+    }
+  }
+
+  /**
    * Disconnect and clean up.
    */
   destroy(): void {
@@ -117,5 +141,6 @@ export class BridgeService {
       this.ws = null;
     }
     this.responseCallback = null;
+    this.ttsCallback = null;
   }
 }

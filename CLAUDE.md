@@ -13,13 +13,13 @@ Hands-free voice interface for Claude Code — talk to Claude from your phone (o
 - Browser debug UI at `http://localhost:8787` — sends messages to Claude Code, receives replies
 - React Native app with WebSocket transport (BridgeService) — **working on phone over WiFi** (confirmed 2026-03-22)
 - **Voice input** — tap mic to start, tap to stop; auto-restart accumulation across pauses (2026-03-24)
+- **TTS output** — ElevenLabs server-side TTS; plugin generates MP3, streams URL to phone; toggle in header; live voice switching via HTTP endpoint (2026-03-24)
 - Plugin registered in Claude Code plugin system and enabled
 - Windows Firewall rule added for port 8787
 - `android:usesCleartextTraffic="true"` set in AndroidManifest (required for HTTP)
 
 ### What's Next
-1. **TTS output** — Android native TTS or server-side (OpenAI TTS API) to read Claude's replies aloud
-2. **BT remote** — Bluetooth shutter remote to toggle mic and send (screen-on wake lock approach)
+1. **BT remote** — Bluetooth shutter remote to toggle mic and send (screen-on wake lock approach)
 3. **Tailscale** — for remote/cellular access outside home WiFi
 4. **Screen-off mode** (future) — requires foreground service + raw audio capture + cloud speech API
 
@@ -49,13 +49,17 @@ The v1 app used Telegram Bot API as transport, which was fundamentally broken:
 **WebSocket protocol:**
 - Send: `{ id: "u<timestamp>-<seq>", text: "message" }`
 - Receive: `{ type: "msg", from: "assistant", text: "response", ... }`
+- TTS config: `{ type: "tts_config", enabled: true|false }`
+- Voice switch: `{ type: "set_voice", voiceId: "<elevenlabs-voice-id>" }`
+- TTS audio: `{ type: "tts", replyId: "<id>", audioUrl: "/files/<id>.mp3" }`
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `App.tsx` | React Native app — setup screen, chat UI, voice input (mic button + auto-restart) |
-| `src/services/bridge.ts` | BridgeService: WebSocket connection, sendMessage, response callbacks |
+| `App.tsx` | React Native app — setup screen, chat UI, voice input, TTS toggle |
+| `src/services/bridge.ts` | BridgeService: WebSocket connection, sendMessage, response/TTS callbacks |
+| `src/services/tts.ts` | TTSService: audio playback via custom AudioPlayer native module |
 | `plugin/server.ts` | Voicebridge MCP channel plugin (forked from fakechat) |
 | `plugin/package.json` | Plugin dependencies (@modelcontextprotocol/sdk) |
 | `plugin/.mcp.json` | MCP server config for Claude Code |
@@ -68,6 +72,7 @@ The v1 app used Telegram Bot API as transport, which was fundamentally broken:
 
 - **React Native 0.84** (TypeScript) — Android app
 - **@react-native-voice/voice** — speech-to-text (patched for RN 0.84 compatibility)
+- **AudioPlayer native module** — custom Android MediaPlayer wrapper for TTS playback (no third-party dep)
 - **react-native-safe-area-context** — safe area insets for input bar layout
 - **voicebridge channel plugin** — custom MCP server (Bun), forked from fakechat
 - **WebSocket** — bidirectional real-time communication
@@ -109,8 +114,11 @@ claude --dangerously-load-development-channels server:voicebridge
 - `server:voicebridge` requires the `--dangerously-load-development-channels` flag
 - When Claude asks to approve the MCP server, say yes
 - The plugin starts an HTTP + WebSocket server on port 8787 (configurable via `VOICEBRIDGE_PORT` env var)
+- **TTS env vars**: `ELEVENLABS_API_KEY` (required for TTS), `ELEVENLABS_VOICE_ID` (optional, default: `21m00Tcm4TlvDq8ikWAM` / Rachel). Currently set to Antoni (`ErXwobaYiN019PkySvjV`)
+- **ElevenLabs requires a paid plan** — free tier gets blocked with "unusual activity detected" error
+- **Live voice switching**: `POST http://localhost:8787/voice/<voiceId>` changes the voice without restart. `GET /voice` returns current voice ID. Also supported via WebSocket: `{ type: "set_voice", voiceId: "<id>" }`
 - Debug web UI available at `http://localhost:8787`
-- If port 8787 is in use from a previous session: `netstat -ano | findstr :8787` then `taskkill /F /PID <pid>`
+- If port 8787 is in use from a previous session: `netstat -ano | findstr :8787` then `taskkill //F //PID <pid>` (note `//` for bash-on-Windows)
 
 ### Plugin Registration (for reference)
 - Plugin is registered in `~/.claude/plugins/installed_plugins.json` as `voicebridge@local`
@@ -134,9 +142,11 @@ export JAVA_HOME="/c/Program Files/Eclipse Adoptium/jdk-17.0.18.8-hotspot"
 
 **Release APK:** `android/app/build/outputs/apk/release/app-release.apk`
 
-**Transfer to phone:**
-- Network share: `cp app-release.apk "//Shawns_Brain/Shawns Brain/transfer/voice-bridge-v2.apk"`
-- Google Drive: `cp app-release.apk "G:\My Drive\transfer\voice-bridge-v2.apk"`
+**Transfer to phone (default):**
+```bash
+cp android/app/build/outputs/apk/release/app-release.apk "//Shawns_Brain/Shawns Brain/transfer/voice-bridge-v2.apk"
+```
+- Alternative: Google Drive: `cp app-release.apk "G:\My Drive\transfer\voice-bridge-v2.apk"`
 
 ### Build Dependencies
 - JDK 17 Temurin: `C:\Program Files\Eclipse Adoptium\jdk-17.0.18.8-hotspot`
@@ -173,8 +183,34 @@ Project MUST live at a short path (e.g., `C:\dev\voice-bridge`). Long paths caus
 The voicebridge plugin (`plugin/server.ts`) is a fork of the official `fakechat` channel plugin with these changes:
 - Binds to `0.0.0.0` instead of `127.0.0.1` (reachable over network)
 - Renamed from "fakechat" to "voicebridge"
-- Added `/health` endpoint for connection checking
+- Added `/health` endpoint for connection checking (includes `voiceId` and `envVoiceId` in response)
+- Added `/voice` GET endpoint (returns current voice ID) and `/voice/:id` POST endpoint (live voice switching)
+- Added `/files/:name` endpoint to serve TTS MP3 files from outbox
+- ElevenLabs TTS generation: on reply, if any WebSocket client has `ttsEnabled: true` and `ELEVENLABS_API_KEY` is set, generates MP3 and broadcasts audio URL
+- WebSocket accepts `tts_config` (enable/disable TTS) and `set_voice` (change ElevenLabs voice) messages
 - Dark theme on the debug web UI
 - Instructions tuned for mobile/voice use case
+
+### Known ElevenLabs Voice IDs
+| Voice | ID | Description |
+|-------|----|-------------|
+| Rachel | `21m00Tcm4TlvDq8ikWAM` | Female, calm, American (default) |
+| Adam | `pNInz6obpgDQGcFmaJgB` | Male, deep, American |
+| Antoni | `ErXwobaYiN019PkySvjV` | Male, warm, American (current) |
+| Josh | `TxGEqnHWrfWFTfGW9XjX` | Male, young, American |
+| Arnold | `VR6AewLTigWG4xSOukaG` | Male, crisp, American |
+| Sam | `yoZ06aMxZJJ28mfd3POQ` | Male, raspy, American |
+| Bella | `EXAVITQu4vr4xnSDxMaL` | Female, soft, American |
+| Elli | `MF3mGyEYCl7XYWbV9V6O` | Female, young, American |
+
+### Plugin Process Gotcha
+**WARNING**: When editing `plugin/server.ts` while the plugin is running, Claude Code may restart the MCP server process, but the OLD process can keep port 8787. This causes a split-brain: the reply tool goes through the new MCP process (via stdio), but HTTP/WebSocket clients connect to the old process. TTS and live voice changes will appear broken.
+
+**Fix**: Kill the stale process before or after editing:
+```bash
+netstat -ano | findstr :8787
+taskkill //F //PID <pid>
+```
+Then restart the Claude Code session. Alternatively, avoid editing `server.ts` while a voice bridge session is active — make edits between sessions.
 
 Source plugin: `~/.claude/plugins/marketplaces/claude-plugins-official/external_plugins/fakechat/`
