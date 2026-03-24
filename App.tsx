@@ -5,7 +5,7 @@
  * channel plugin. Phone connects directly over WebSocket — no Telegram.
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -16,8 +16,15 @@ import {
   StatusBar,
   Alert,
   KeyboardAvoidingView,
+  Platform,
+  PermissionsAndroid,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import Voice, {
+  SpeechResultsEvent,
+  SpeechErrorEvent,
+} from '@react-native-voice/voice';
+import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BridgeService } from './src/services/bridge';
 
 // ─────────────────────────────────────────────────────
@@ -45,7 +52,9 @@ const STORAGE_KEYS = {
 // App
 // ─────────────────────────────────────────────────────
 
-const App: React.FC = () => {
+const AppContent: React.FC = () => {
+  const insets = useSafeAreaInsets();
+
   // Navigation
   const [screen, setScreen] = useState<Screen>('setup');
   const [loading, setLoading] = useState(true);
@@ -61,9 +70,151 @@ const App: React.FC = () => {
   // Text input
   const [inputText, setInputText] = useState('');
 
+  // Voice input
+  const [isListening, setIsListening] = useState(false);
+  const [partialText, setPartialText] = useState('');
+  const shouldListen = useRef(false);
+  const accumulatedText = useRef('');
+  const partialRef = useRef('');
+  const stoppingRef = useRef(false);
+
   // Refs
   const bridgeRef = useRef<BridgeService | null>(null);
   const scrollRef = useRef<ScrollView>(null);
+
+  // ─────────────────────────────────────────────────
+  // Voice recognition setup
+  // ─────────────────────────────────────────────────
+
+  const startRecognizer = useCallback(async () => {
+    try {
+      await Voice.start('en-US');
+    } catch (err: any) {
+      // If restart fails, stop the session
+      shouldListen.current = false;
+      setIsListening(false);
+      setPartialText('');
+      const accumulated = accumulatedText.current.trim();
+      if (accumulated) {
+        setInputText(accumulated);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    Voice.onSpeechStart = () => {
+      setIsListening(true);
+    };
+
+    Voice.onSpeechEnd = () => {
+      // Don't stop — auto-restart will handle it if shouldListen is true
+      if (!shouldListen.current) {
+        setIsListening(false);
+      }
+    };
+
+    Voice.onSpeechPartialResults = (e: SpeechResultsEvent) => {
+      if (e.value && e.value[0]) {
+        partialRef.current = e.value[0];
+        setPartialText(e.value[0]);
+      }
+    };
+
+    Voice.onSpeechResults = (e: SpeechResultsEvent) => {
+      // Ignore results fired during stop sequence
+      if (stoppingRef.current) return;
+
+      if (e.value && e.value[0]) {
+        const transcript = e.value[0].trim();
+        if (transcript) {
+          const sep = accumulatedText.current ? ' ' : '';
+          accumulatedText.current += sep + transcript;
+          setInputText(accumulatedText.current);
+        }
+      }
+      partialRef.current = '';
+      setPartialText('');
+
+      // Auto-restart if still in a listening session
+      if (shouldListen.current) {
+        startRecognizer();
+      } else {
+        setIsListening(false);
+      }
+    };
+
+    Voice.onSpeechError = (e: SpeechErrorEvent) => {
+      // Ignore errors fired during stop sequence
+      if (stoppingRef.current) return;
+
+      setPartialText('');
+      // error code 5 = no speech detected — restart silently if still listening
+      if (shouldListen.current) {
+        startRecognizer();
+        return;
+      }
+      setIsListening(false);
+    };
+
+    return () => {
+      Voice.destroy().then(Voice.removeAllListeners);
+    };
+  }, [startRecognizer]);
+
+  const requestMicPermission = async (): Promise<boolean> => {
+    if (Platform.OS !== 'android') return true;
+    const granted = await PermissionsAndroid.request(
+      PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+    );
+    return granted === PermissionsAndroid.RESULTS.GRANTED;
+  };
+
+  const toggleListening = useCallback(async () => {
+    try {
+      if (shouldListen.current) {
+        // Stop listening — set flags first to prevent auto-restart and ignore callbacks
+        shouldListen.current = false;
+        stoppingRef.current = true;
+
+        // Capture any in-progress partial text before cancelling
+        if (partialRef.current.trim()) {
+          const sep = accumulatedText.current ? ' ' : '';
+          accumulatedText.current += sep + partialRef.current.trim();
+        }
+
+        try {
+          await Voice.cancel();
+        } catch {
+          // Recognizer may already be stopped between restart cycles
+        }
+
+        const finalText = accumulatedText.current.trim();
+        if (finalText) {
+          setInputText(finalText);
+        }
+        partialRef.current = '';
+        setPartialText('');
+        setIsListening(false);
+        stoppingRef.current = false;
+      } else {
+        const hasPermission = await requestMicPermission();
+        if (!hasPermission) {
+          Alert.alert('Permission Required', 'Microphone permission is needed for voice input.');
+          return;
+        }
+        // Start a new listening session
+        accumulatedText.current = '';
+        setPartialText('');
+        setIsListening(true);
+        shouldListen.current = true;
+        await startRecognizer();
+      }
+    } catch (err: any) {
+      Alert.alert('Voice Error', String(err?.message || err));
+      shouldListen.current = false;
+      setIsListening(false);
+    }
+  }, [startRecognizer]);
 
   // ─────────────────────────────────────────────────
   // Init: load saved config
@@ -297,7 +448,7 @@ const App: React.FC = () => {
         {conversation.length === 0 ? (
           <View style={styles.emptyState}>
             <Text style={styles.emptyText}>
-              Type a message below to talk to Claude
+              Tap the mic or type to talk to Claude
             </Text>
           </View>
         ) : (
@@ -319,14 +470,36 @@ const App: React.FC = () => {
         )}
       </ScrollView>
 
+      {/* Voice partial transcript */}
+      {isListening && partialText ? (
+        <View style={styles.partialBar}>
+          <Text style={styles.partialText} numberOfLines={3}>
+            {accumulatedText.current ? accumulatedText.current + ' ' + partialText : partialText}
+          </Text>
+        </View>
+      ) : null}
+
       {/* Message input */}
-      <View style={styles.inputBar}>
+      <View style={[styles.inputBar, { paddingBottom: Math.max(insets.bottom, 10) }]}>
+        <TouchableOpacity
+          style={[
+            styles.micButton,
+            isListening && styles.micButtonActive,
+          ]}
+          onPress={toggleListening}
+          activeOpacity={0.7}>
+          <Text style={styles.micButtonText}>{isListening ? '⏹' : '🎤'}</Text>
+        </TouchableOpacity>
+
         <TextInput
           style={styles.messageInput}
           value={inputText}
           onChangeText={setInputText}
-          placeholder="Type a message..."
+          placeholder={isListening ? 'Listening...' : 'Type or tap mic...'}
           placeholderTextColor="#555"
+          multiline
+          maxHeight={120}
+          blurOnSubmit
           returnKeyType="send"
           onSubmitEditing={() => {
             if (inputText.trim()) {
@@ -526,16 +699,47 @@ const styles = StyleSheet.create({
     lineHeight: 20,
   },
 
+  // ─── Voice Partial Transcript ───
+  partialBar: {
+    paddingHorizontal: 16,
+    paddingVertical: 6,
+    backgroundColor: '#111',
+    borderTopWidth: 1,
+    borderTopColor: '#1a1a1a',
+  },
+  partialText: {
+    color: '#888',
+    fontSize: 13,
+    fontStyle: 'italic',
+  },
+
   // ─── Message Input Bar ───
   inputBar: {
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 12,
     paddingVertical: 10,
-    paddingBottom: 40,
     borderTopWidth: 1,
     borderTopColor: '#1a1a1a',
     backgroundColor: '#0a0a0a',
+  },
+  micButton: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: '#222',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 8,
+    borderWidth: 1,
+    borderColor: '#333',
+  },
+  micButtonActive: {
+    backgroundColor: '#7f1d1d',
+    borderColor: '#ef4444',
+  },
+  micButtonText: {
+    fontSize: 18,
   },
   messageInput: {
     flex: 1,
@@ -561,5 +765,11 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
 });
+
+const App: React.FC = () => (
+  <SafeAreaProvider>
+    <AppContent />
+  </SafeAreaProvider>
+);
 
 export default App;
