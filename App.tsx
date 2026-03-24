@@ -18,6 +18,8 @@ import {
   KeyboardAvoidingView,
   Platform,
   PermissionsAndroid,
+  NativeModules,
+  NativeEventEmitter,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Voice, {
@@ -27,6 +29,9 @@ import Voice, {
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BridgeService } from './src/services/bridge';
 import { TTSService } from './src/services/tts';
+
+const { RemoteButton } = NativeModules;
+const remoteButtonEmitter = new NativeEventEmitter(RemoteButton);
 
 // ─────────────────────────────────────────────────────
 // Types
@@ -48,6 +53,7 @@ const STORAGE_KEYS = {
   SERVER_URL: '@cvb_server_url',
   SETUP_COMPLETE: '@cvb_setup_complete',
   TTS_ENABLED: '@cvb_tts_enabled',
+  REMOTE_ENABLED: '@cvb_remote_enabled',
 };
 
 // ─────────────────────────────────────────────────────
@@ -84,6 +90,10 @@ const AppContent: React.FC = () => {
   const [ttsEnabled, setTtsEnabled] = useState(false);
   const ttsEnabledRef = useRef(false);
   const ttsServiceRef = useRef<TTSService | null>(null);
+
+  // BT Remote
+  const [remoteEnabled, setRemoteEnabled] = useState(false);
+  const remoteEnabledRef = useRef(false);
 
   // Refs
   const bridgeRef = useRef<BridgeService | null>(null);
@@ -224,22 +234,91 @@ const AppContent: React.FC = () => {
   }, [startRecognizer]);
 
   // ─────────────────────────────────────────────────
+  // Send helper (used by send button + BT remote)
+  // ─────────────────────────────────────────────────
+
+  const handleSend = useCallback(() => {
+    const text = inputText.trim();
+    if (!text) return;
+    sendToClaud(text);
+    setInputText('');
+    accumulatedText.current = '';
+  }, [inputText]);
+
+  // ─────────────────────────────────────────────────
+  // BT Remote
+  // ─────────────────────────────────────────────────
+
+  const toggleRemote = useCallback(async () => {
+    const next = !remoteEnabled;
+    setRemoteEnabled(next);
+    remoteEnabledRef.current = next;
+    RemoteButton.setEnabled(next);
+    RemoteButton.setKeepScreenOn(next);
+    await AsyncStorage.setItem(STORAGE_KEYS.REMOTE_ENABLED, next ? 'true' : 'false');
+  }, [remoteEnabled]);
+
+  // Listen for BT remote button presses (only KEYCODE_MEDIA_NEXT = 87)
+  useEffect(() => {
+    const sub = remoteButtonEmitter.addListener('remoteButton', (keyCode: number) => {
+      if (!remoteEnabledRef.current) return;
+      if (keyCode !== 87) return; // Only skip forward
+
+      if (shouldListen.current) {
+        // Currently listening → stop + auto-send
+        shouldListen.current = false;
+        stoppingRef.current = true;
+
+        if (partialRef.current.trim()) {
+          const sep = accumulatedText.current ? ' ' : '';
+          accumulatedText.current += sep + partialRef.current.trim();
+        }
+
+        Voice.cancel().catch(() => {});
+
+        const finalText = accumulatedText.current.trim();
+        partialRef.current = '';
+        setPartialText('');
+        setIsListening(false);
+        stoppingRef.current = false;
+
+        if (finalText) {
+          setInputText('');
+          accumulatedText.current = '';
+          sendToClaud(finalText);
+        }
+      } else {
+        toggleListening();
+      }
+    });
+
+    return () => sub.remove();
+  }, [toggleListening]);
+
+  // ─────────────────────────────────────────────────
   // Init: load saved config
   // ─────────────────────────────────────────────────
 
   useEffect(() => {
     (async () => {
       try {
-        const [url, setupDone, ttsStored] = await Promise.all([
+        const [url, setupDone, ttsStored, remoteStored] = await Promise.all([
           AsyncStorage.getItem(STORAGE_KEYS.SERVER_URL),
           AsyncStorage.getItem(STORAGE_KEYS.SETUP_COMPLETE),
           AsyncStorage.getItem(STORAGE_KEYS.TTS_ENABLED),
+          AsyncStorage.getItem(STORAGE_KEYS.REMOTE_ENABLED),
         ]);
 
         if (url) setServerUrl(url);
         if (ttsStored === 'true') {
           setTtsEnabled(true);
           ttsEnabledRef.current = true;
+        }
+        if (remoteStored === 'true') {
+          setRemoteEnabled(true);
+          remoteEnabledRef.current = true;
+          RemoteButton.setEnabled(true);
+          RemoteButton.setKeepScreenOn(true);
         }
 
         if (setupDone === 'true' && url) {
@@ -464,6 +543,11 @@ const AppContent: React.FC = () => {
           </Text>
         </View>
         <View style={styles.headerRight}>
+          <TouchableOpacity onPress={toggleRemote}>
+            <Text style={[styles.headerSettings, remoteEnabled && { color: '#3b82f6' }]}>
+              {remoteEnabled ? '\u{1F399}' : '\u{1F3AE}'}
+            </Text>
+          </TouchableOpacity>
           <TouchableOpacity onPress={toggleTTS}>
             <Text style={[styles.headerSettings, ttsEnabled && { color: '#d97706' }]}>
               {ttsEnabled ? '\uD83D\uDD0A' : '\uD83D\uDD07'}
@@ -475,6 +559,10 @@ const AppContent: React.FC = () => {
               setIsConnected(false);
               bridgeRef.current?.destroy();
               ttsServiceRef.current?.destroy();
+              if (remoteEnabledRef.current) {
+                RemoteButton.setEnabled(false);
+                RemoteButton.setKeepScreenOn(false);
+              }
             }}>
             <Text style={styles.headerSettings}>⚙</Text>
           </TouchableOpacity>
@@ -543,22 +631,12 @@ const AppContent: React.FC = () => {
           maxHeight={120}
           blurOnSubmit
           returnKeyType="send"
-          onSubmitEditing={() => {
-            if (inputText.trim()) {
-              sendToClaud(inputText.trim());
-              setInputText('');
-            }
-          }}
+          onSubmitEditing={handleSend}
         />
         <TouchableOpacity
           style={[styles.sendButton, !inputText.trim() && { opacity: 0.4 }]}
           disabled={!inputText.trim()}
-          onPress={() => {
-            if (inputText.trim()) {
-              sendToClaud(inputText.trim());
-              setInputText('');
-            }
-          }}>
+          onPress={handleSend}>
           <Text style={styles.sendButtonText}>Send</Text>
         </TouchableOpacity>
       </View>

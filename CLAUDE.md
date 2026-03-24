@@ -4,7 +4,7 @@ Hands-free voice interface for Claude Code — talk to Claude from your phone (o
 
 ## Project Status
 
-**Phase: v2 — Direct HTTP bridge via custom channel plugin (voice input working, adding TTS + BT remote)**
+**Phase: v2 — Direct HTTP bridge via custom channel plugin (voice + TTS + BT remote working)**
 
 **Project location: `C:\dev\voice-bridge`**
 
@@ -17,9 +17,10 @@ Hands-free voice interface for Claude Code — talk to Claude from your phone (o
 - Plugin registered in Claude Code plugin system and enabled
 - Windows Firewall rule added for port 8787
 - `android:usesCleartextTraffic="true"` set in AndroidManifest (required for HTTP)
+- **BT remote** — Bluetooth shutter remote skip-forward button toggles mic; press to start listening, press again to stop + auto-send; screen-on wake lock; toggle in header (2026-03-24)
 
 ### What's Next
-1. **BT remote** — Bluetooth shutter remote to toggle mic and send (screen-on wake lock approach)
+1. **Better STT model** — replace Android's built-in SpeechRecognizer with a more accurate cloud model (e.g., Whisper API, Deepgram, or Google Cloud Speech-to-Text)
 3. **Tailscale** — for remote/cellular access outside home WiFi
 4. **Screen-off mode** (future) — requires foreground service + raw audio capture + cloud speech API
 
@@ -57,7 +58,7 @@ The v1 app used Telegram Bot API as transport, which was fundamentally broken:
 
 | File | Purpose |
 |------|---------|
-| `App.tsx` | React Native app — setup screen, chat UI, voice input, TTS toggle |
+| `App.tsx` | React Native app — setup screen, chat UI, voice input, TTS toggle, BT remote |
 | `src/services/bridge.ts` | BridgeService: WebSocket connection, sendMessage, response/TTS callbacks |
 | `src/services/tts.ts` | TTSService: audio playback via custom AudioPlayer native module |
 | `plugin/server.ts` | Voicebridge MCP channel plugin (forked from fakechat) |
@@ -73,6 +74,7 @@ The v1 app used Telegram Bot API as transport, which was fundamentally broken:
 - **React Native 0.84** (TypeScript) — Android app
 - **@react-native-voice/voice** — speech-to-text (patched for RN 0.84 compatibility)
 - **AudioPlayer native module** — custom Android MediaPlayer wrapper for TTS playback (no third-party dep)
+- **RemoteButton native module** — MediaSession + dispatchKeyEvent interception for BT remote control
 - **react-native-safe-area-context** — safe area insets for input bar layout
 - **voicebridge channel plugin** — custom MCP server (Bun), forked from fakechat
 - **WebSocket** — bidirectional real-time communication
@@ -98,6 +100,29 @@ The voice input uses Android's SpeechRecognizer via `@react-native-voice/voice` 
 **Patches required** (`patches/@react-native-voice+voice+3.2.4.patch`):
 - `android/build.gradle`: replaced `jcenter()` with `mavenCentral()`/`google()`, added `namespace`, updated SDK versions
 - `VoiceModule.java`: changed `getName()` from `"RCTVoice"` to `"Voice"` (JS/native name mismatch)
+
+## BT Remote Details
+
+The BT remote feature uses a Bluetooth shutter remote's skip forward button (`KEYCODE_MEDIA_NEXT` = 87) to control voice input hands-free.
+
+**Flow:**
+1. User enables BT remote toggle in header (blue icon)
+2. Press skip forward → starts voice recognition (same as tapping mic)
+3. Speak → voice accumulates across pauses (auto-restart)
+4. Press skip forward again → stops recognition + **auto-sends** accumulated text
+5. Screen stays on via `FLAG_KEEP_SCREEN_ON` while remote mode is active
+
+**Native implementation (two layers):**
+- `RemoteButtonModule.kt` — creates a `MediaSession` with audio focus + `PlaybackState.STATE_PLAYING` to receive media button routing from Android. Emits `"remoteButton"` events to JS via `RCTDeviceEventEmitter`
+- `MainActivity.kt` — overrides `dispatchKeyEvent()` as a fallback to catch media keys at the Activity level (more reliable for generic BT shutter remotes that don't route through MediaSession)
+- Only `KEYCODE_MEDIA_NEXT` (87) is intercepted; all other keys pass through normally
+- `RemoteButtonModule.instance` static ref allows MainActivity to forward events to the module
+- Module is only active when `setEnabled(true)` is called (toggled via header icon)
+
+**Key files:**
+- `android/.../RemoteButtonModule.kt` — native module (MediaSession, audio focus, wake lock, event emitter)
+- `android/.../RemoteButtonPackage.kt` — ReactPackage registration
+- `android/.../MainActivity.kt` — `dispatchKeyEvent` override for BT key interception
 
 ## Running the Plugin
 
