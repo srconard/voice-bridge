@@ -246,6 +246,45 @@ Bun.serve({
       })()
     }
 
+    if (url.pathname === '/transcribe' && req.method === 'POST') {
+      return (async () => {
+        const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? ''
+        if (!OPENAI_API_KEY) {
+          return new Response(JSON.stringify({ error: 'OPENAI_API_KEY not set' }), {
+            status: 500, headers: { 'content-type': 'application/json' },
+          })
+        }
+        const form = await req.formData()
+        const file = form.get('file')
+        if (!(file instanceof File)) {
+          return new Response(JSON.stringify({ error: 'missing file' }), {
+            status: 400, headers: { 'content-type': 'application/json' },
+          })
+        }
+        const whisperForm = new FormData()
+        whisperForm.append('file', file, file.name || 'audio.wav')
+        whisperForm.append('model', 'whisper-1')
+        whisperForm.append('language', 'en')
+
+        const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}` },
+          body: whisperForm,
+        })
+        if (!res.ok) {
+          const err = await res.text()
+          process.stderr.write(`Whisper API error: ${res.status} ${err}\n`)
+          return new Response(JSON.stringify({ error: `Whisper API: ${res.status}` }), {
+            status: 502, headers: { 'content-type': 'application/json' },
+          })
+        }
+        const result = await res.json() as { text: string }
+        return new Response(JSON.stringify({ text: result.text }), {
+          headers: { 'content-type': 'application/json' },
+        })
+      })()
+    }
+
     if (url.pathname === '/voice' && req.method === 'GET') {
       return new Response(JSON.stringify({ voiceId: elevenLabsVoiceId }), {
         headers: { 'content-type': 'application/json' },

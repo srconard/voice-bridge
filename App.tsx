@@ -22,10 +22,8 @@ import {
   NativeEventEmitter,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import Voice, {
-  SpeechResultsEvent,
-  SpeechErrorEvent,
-} from '@react-native-voice/voice';
+const { AudioRecorder } = NativeModules;
+const audioRecorderEmitter = new NativeEventEmitter(AudioRecorder);
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BridgeService } from './src/services/bridge';
 import { TTSService } from './src/services/tts';
@@ -78,13 +76,11 @@ const AppContent: React.FC = () => {
   // Text input
   const [inputText, setInputText] = useState('');
 
-  // Voice input
-  const [isListening, setIsListening] = useState(false);
-  const [partialText, setPartialText] = useState('');
-  const shouldListen = useRef(false);
-  const accumulatedText = useRef('');
-  const partialRef = useRef('');
-  const stoppingRef = useRef(false);
+  // Voice input (Whisper)
+  const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [audioLevel, setAudioLevel] = useState(0);
+  const isRecordingRef = useRef(false);
 
   // TTS
   const [ttsEnabled, setTtsEnabled] = useState(false);
@@ -100,83 +96,15 @@ const AppContent: React.FC = () => {
   const scrollRef = useRef<ScrollView>(null);
 
   // ─────────────────────────────────────────────────
-  // Voice recognition setup
+  // Voice recording + Whisper transcription
   // ─────────────────────────────────────────────────
 
-  const startRecognizer = useCallback(async () => {
-    try {
-      await Voice.start('en-US');
-    } catch (err: any) {
-      // If restart fails, stop the session
-      shouldListen.current = false;
-      setIsListening(false);
-      setPartialText('');
-      const accumulated = accumulatedText.current.trim();
-      if (accumulated) {
-        setInputText(accumulated);
-      }
-    }
-  }, []);
-
   useEffect(() => {
-    Voice.onSpeechStart = () => {
-      setIsListening(true);
-    };
-
-    Voice.onSpeechEnd = () => {
-      // Don't stop — auto-restart will handle it if shouldListen is true
-      if (!shouldListen.current) {
-        setIsListening(false);
-      }
-    };
-
-    Voice.onSpeechPartialResults = (e: SpeechResultsEvent) => {
-      if (e.value && e.value[0]) {
-        partialRef.current = e.value[0];
-        setPartialText(e.value[0]);
-      }
-    };
-
-    Voice.onSpeechResults = (e: SpeechResultsEvent) => {
-      // Ignore results fired during stop sequence
-      if (stoppingRef.current) return;
-
-      if (e.value && e.value[0]) {
-        const transcript = e.value[0].trim();
-        if (transcript) {
-          const sep = accumulatedText.current ? ' ' : '';
-          accumulatedText.current += sep + transcript;
-          setInputText(accumulatedText.current);
-        }
-      }
-      partialRef.current = '';
-      setPartialText('');
-
-      // Auto-restart if still in a listening session
-      if (shouldListen.current) {
-        startRecognizer();
-      } else {
-        setIsListening(false);
-      }
-    };
-
-    Voice.onSpeechError = (e: SpeechErrorEvent) => {
-      // Ignore errors fired during stop sequence
-      if (stoppingRef.current) return;
-
-      setPartialText('');
-      // error code 5 = no speech detected — restart silently if still listening
-      if (shouldListen.current) {
-        startRecognizer();
-        return;
-      }
-      setIsListening(false);
-    };
-
-    return () => {
-      Voice.destroy().then(Voice.removeAllListeners);
-    };
-  }, [startRecognizer]);
+    const sub = audioRecorderEmitter.addListener('audioLevel', (level: number) => {
+      setAudioLevel(level);
+    });
+    return () => sub.remove();
+  }, []);
 
   const requestMicPermission = async (): Promise<boolean> => {
     if (Platform.OS !== 'android') return true;
@@ -186,52 +114,64 @@ const AppContent: React.FC = () => {
     return granted === PermissionsAndroid.RESULTS.GRANTED;
   };
 
+  const transcribeAudio = useCallback(async (filePath: string): Promise<string | null> => {
+    const url = serverUrl.trim();
+    if (!url) return null;
+
+    const formData = new FormData();
+    formData.append('file', {
+      uri: 'file://' + filePath,
+      type: 'audio/wav',
+      name: 'audio.wav',
+    } as any);
+
+    const res = await fetch(`${url}/transcribe`, {
+      method: 'POST',
+      body: formData,
+    });
+    const json = await res.json();
+    if (json.error) throw new Error(json.error);
+    return json.text || null;
+  }, [serverUrl]);
+
+  const stopAndTranscribe = useCallback(async (): Promise<string | null> => {
+    setIsRecording(false);
+    isRecordingRef.current = false;
+    setIsTranscribing(true);
+    try {
+      const filePath = await AudioRecorder.stop();
+      const text = await transcribeAudio(filePath);
+      return text;
+    } finally {
+      setIsTranscribing(false);
+      setAudioLevel(0);
+    }
+  }, [transcribeAudio]);
+
   const toggleListening = useCallback(async () => {
     try {
-      if (shouldListen.current) {
-        // Stop listening — set flags first to prevent auto-restart and ignore callbacks
-        shouldListen.current = false;
-        stoppingRef.current = true;
-
-        // Capture any in-progress partial text before cancelling
-        if (partialRef.current.trim()) {
-          const sep = accumulatedText.current ? ' ' : '';
-          accumulatedText.current += sep + partialRef.current.trim();
+      if (isRecordingRef.current) {
+        const text = await stopAndTranscribe();
+        if (text) {
+          setInputText(prev => prev ? prev + ' ' + text : text);
         }
-
-        try {
-          await Voice.cancel();
-        } catch {
-          // Recognizer may already be stopped between restart cycles
-        }
-
-        const finalText = accumulatedText.current.trim();
-        if (finalText) {
-          setInputText(finalText);
-        }
-        partialRef.current = '';
-        setPartialText('');
-        setIsListening(false);
-        stoppingRef.current = false;
       } else {
         const hasPermission = await requestMicPermission();
         if (!hasPermission) {
           Alert.alert('Permission Required', 'Microphone permission is needed for voice input.');
           return;
         }
-        // Start a new listening session
-        accumulatedText.current = '';
-        setPartialText('');
-        setIsListening(true);
-        shouldListen.current = true;
-        await startRecognizer();
+        setIsRecording(true);
+        isRecordingRef.current = true;
+        AudioRecorder.start();
       }
     } catch (err: any) {
       Alert.alert('Voice Error', String(err?.message || err));
-      shouldListen.current = false;
-      setIsListening(false);
+      setIsRecording(false);
+      isRecordingRef.current = false;
+      setIsTranscribing(false);
     }
-  }, [startRecognizer]);
+  }, [stopAndTranscribe]);
 
   // ─────────────────────────────────────────────────
   // Send helper (used by send button + BT remote)
@@ -242,7 +182,6 @@ const AppContent: React.FC = () => {
     if (!text) return;
     sendToClaud(text);
     setInputText('');
-    accumulatedText.current = '';
   }, [inputText]);
 
   // ─────────────────────────────────────────────────
@@ -260,32 +199,23 @@ const AppContent: React.FC = () => {
 
   // Listen for BT remote button presses (only KEYCODE_MEDIA_NEXT = 87)
   useEffect(() => {
-    const sub = remoteButtonEmitter.addListener('remoteButton', (keyCode: number) => {
+    const sub = remoteButtonEmitter.addListener('remoteButton', async (keyCode: number) => {
       if (!remoteEnabledRef.current) return;
       if (keyCode !== 87) return; // Only skip forward
 
-      if (shouldListen.current) {
-        // Currently listening → stop + auto-send
-        shouldListen.current = false;
-        stoppingRef.current = true;
-
-        if (partialRef.current.trim()) {
-          const sep = accumulatedText.current ? ' ' : '';
-          accumulatedText.current += sep + partialRef.current.trim();
-        }
-
-        Voice.cancel().catch(() => {});
-
-        const finalText = accumulatedText.current.trim();
-        partialRef.current = '';
-        setPartialText('');
-        setIsListening(false);
-        stoppingRef.current = false;
-
-        if (finalText) {
-          setInputText('');
-          accumulatedText.current = '';
-          sendToClaud(finalText);
+      if (isRecordingRef.current) {
+        // Currently recording → stop, transcribe, auto-send
+        try {
+          const text = await stopAndTranscribe();
+          if (text) {
+            setInputText('');
+            sendToClaud(text);
+          }
+        } catch (err: any) {
+          Alert.alert('Transcription Error', String(err?.message || err));
+          setIsRecording(false);
+          isRecordingRef.current = false;
+          setIsTranscribing(false);
         }
       } else {
         toggleListening();
@@ -293,7 +223,7 @@ const AppContent: React.FC = () => {
     });
 
     return () => sub.remove();
-  }, [toggleListening]);
+  }, [toggleListening, stopAndTranscribe]);
 
   // ─────────────────────────────────────────────────
   // Init: load saved config
@@ -600,12 +530,20 @@ const AppContent: React.FC = () => {
         )}
       </ScrollView>
 
-      {/* Voice partial transcript */}
-      {isListening && partialText ? (
+      {/* Voice recording / transcribing indicator */}
+      {isRecording ? (
         <View style={styles.partialBar}>
-          <Text style={styles.partialText} numberOfLines={3}>
-            {accumulatedText.current ? accumulatedText.current + ' ' + partialText : partialText}
-          </Text>
+          <View style={styles.recordingRow}>
+            <View style={[styles.recordingDot, { opacity: 0.5 + audioLevel * 0.5 }]} />
+            <Text style={styles.partialText}>Recording...</Text>
+            <View style={styles.volumeBarContainer}>
+              <View style={[styles.volumeBar, { width: `${Math.round(audioLevel * 100)}%` }]} />
+            </View>
+          </View>
+        </View>
+      ) : isTranscribing ? (
+        <View style={styles.partialBar}>
+          <Text style={styles.partialText}>Transcribing...</Text>
         </View>
       ) : null}
 
@@ -614,18 +552,22 @@ const AppContent: React.FC = () => {
         <TouchableOpacity
           style={[
             styles.micButton,
-            isListening && styles.micButtonActive,
+            isRecording && styles.micButtonActive,
+            isTranscribing && styles.micButtonTranscribing,
           ]}
           onPress={toggleListening}
+          disabled={isTranscribing}
           activeOpacity={0.7}>
-          <Text style={styles.micButtonText}>{isListening ? '⏹' : '🎤'}</Text>
+          <Text style={styles.micButtonText}>
+            {isTranscribing ? '...' : isRecording ? '⏹' : '🎤'}
+          </Text>
         </TouchableOpacity>
 
         <TextInput
           style={styles.messageInput}
           value={inputText}
           onChangeText={setInputText}
-          placeholder={isListening ? 'Listening...' : 'Type or tap mic...'}
+          placeholder={isRecording ? 'Recording...' : isTranscribing ? 'Transcribing...' : 'Type or tap mic...'}
           placeholderTextColor="#555"
           multiline
           maxHeight={120}
@@ -824,7 +766,7 @@ const styles = StyleSheet.create({
     lineHeight: 20,
   },
 
-  // ─── Voice Partial Transcript ───
+  // ─── Voice Recording Indicator ───
   partialBar: {
     paddingHorizontal: 16,
     paddingVertical: 6,
@@ -836,6 +778,29 @@ const styles = StyleSheet.create({
     color: '#888',
     fontSize: 13,
     fontStyle: 'italic',
+  },
+  recordingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  recordingDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: '#ef4444',
+  },
+  volumeBarContainer: {
+    flex: 1,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: '#222',
+    overflow: 'hidden',
+  },
+  volumeBar: {
+    height: '100%',
+    backgroundColor: '#ef4444',
+    borderRadius: 3,
   },
 
   // ─── Message Input Bar ───
@@ -862,6 +827,11 @@ const styles = StyleSheet.create({
   micButtonActive: {
     backgroundColor: '#7f1d1d',
     borderColor: '#ef4444',
+  },
+  micButtonTranscribing: {
+    backgroundColor: '#1a1a2a',
+    borderColor: '#3b82f6',
+    opacity: 0.6,
   },
   micButtonText: {
     fontSize: 18,
