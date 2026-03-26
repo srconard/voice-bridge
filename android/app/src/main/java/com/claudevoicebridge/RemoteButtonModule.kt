@@ -118,6 +118,31 @@ class RemoteButtonModule(reactContext: ReactApplicationContext) :
         audioFocusRequest = null
     }
 
+    /**
+     * Fully suspend the MediaSession + audio focus so SCO can activate.
+     * Safe to call from any thread.
+     */
+    fun suspendForRecording() {
+        val activity = reactApplicationContext.currentActivity ?: return
+        activity.runOnUiThread {
+            stopSession()
+        }
+    }
+
+    /**
+     * Restore MediaSession + audio focus after recording.
+     * Does a full stop/start cycle to ensure clean state after BT SCO/voice recognition.
+     * Safe to call from any thread.
+     */
+    fun resumeAfterRecording() {
+        if (!enabled) return
+        val activity = reactApplicationContext.currentActivity ?: return
+        activity.runOnUiThread {
+            stopSession()
+            startSession()
+        }
+    }
+
     fun emitButtonPress(keyCode: Int) {
         try {
             reactApplicationContext

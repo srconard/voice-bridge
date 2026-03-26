@@ -20,6 +20,7 @@ import {
   PermissionsAndroid,
   NativeModules,
   NativeEventEmitter,
+  Clipboard,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 const { AudioRecorder } = NativeModules;
@@ -80,6 +81,7 @@ const AppContent: React.FC = () => {
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [audioLevel, setAudioLevel] = useState(0);
+  const [audioStatus, setAudioStatus] = useState('');
   const isRecordingRef = useRef(false);
 
   // TTS
@@ -103,7 +105,19 @@ const AppContent: React.FC = () => {
     const sub = audioRecorderEmitter.addListener('audioLevel', (level: number) => {
       setAudioLevel(level);
     });
-    return () => sub.remove();
+    const statusSub = audioRecorderEmitter.addListener('audioStatus', (msg: string) => {
+      setAudioStatus(prev => prev ? prev + '\n' + msg : msg);
+    });
+    // Request permissions eagerly on mount so BT is ready before first recording
+    if (Platform.OS === 'android') {
+      (async () => {
+        await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
+        if (Platform.Version >= 31) {
+          await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT);
+        }
+      })();
+    }
+    return () => { sub.remove(); statusSub.remove(); };
   }, []);
 
   const requestMicPermission = async (): Promise<boolean> => {
@@ -111,18 +125,27 @@ const AppContent: React.FC = () => {
     const granted = await PermissionsAndroid.request(
       PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
     );
-    return granted === PermissionsAndroid.RESULTS.GRANTED;
+    if (granted !== PermissionsAndroid.RESULTS.GRANTED) return false;
+
+    // Request BLUETOOTH_CONNECT for BT mic support (Android 12+)
+    if (Platform.Version >= 31) {
+      await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+      );
+    }
+    return true;
   };
 
   const transcribeAudio = useCallback(async (filePath: string): Promise<string | null> => {
     const url = serverUrl.trim();
     if (!url) return null;
 
+    const isWav = filePath.endsWith('.wav');
     const formData = new FormData();
     formData.append('file', {
       uri: 'file://' + filePath,
-      type: 'audio/wav',
-      name: 'audio.wav',
+      type: isWav ? 'audio/wav' : 'audio/3gpp',
+      name: isWav ? 'audio.wav' : 'audio.3gp',
     } as any);
 
     const res = await fetch(`${url}/transcribe`, {
@@ -161,6 +184,7 @@ const AppContent: React.FC = () => {
           Alert.alert('Permission Required', 'Microphone permission is needed for voice input.');
           return;
         }
+        setAudioStatus('');
         setIsRecording(true);
         isRecordingRef.current = true;
         AudioRecorder.start();
@@ -540,10 +564,33 @@ const AppContent: React.FC = () => {
               <View style={[styles.volumeBar, { width: `${Math.round(audioLevel * 100)}%` }]} />
             </View>
           </View>
+          {audioStatus ? (
+            <View>
+              <ScrollView style={styles.audioStatusScroll}>
+                <Text style={styles.audioStatusText} selectable>{audioStatus}</Text>
+              </ScrollView>
+              <TouchableOpacity
+                style={styles.copyLogButton}
+                onPress={() => { Clipboard.setString(audioStatus); Alert.alert('Copied', 'Log copied to clipboard'); }}>
+                <Text style={styles.copyLogText}>Copy Log</Text>
+              </TouchableOpacity>
+            </View>
+          ) : null}
         </View>
       ) : isTranscribing ? (
         <View style={styles.partialBar}>
           <Text style={styles.partialText}>Transcribing...</Text>
+        </View>
+      ) : audioStatus ? (
+        <View style={styles.partialBar}>
+          <ScrollView style={styles.audioStatusScroll}>
+            <Text style={styles.audioStatusText} selectable>{audioStatus}</Text>
+          </ScrollView>
+          <TouchableOpacity
+            style={styles.copyLogButton}
+            onPress={() => { Clipboard.setString(audioStatus); Alert.alert('Copied', 'Log copied to clipboard'); }}>
+            <Text style={styles.copyLogText}>Copy Log</Text>
+          </TouchableOpacity>
         </View>
       ) : null}
 
@@ -778,6 +825,26 @@ const styles = StyleSheet.create({
     color: '#888',
     fontSize: 13,
     fontStyle: 'italic',
+  },
+  audioStatusScroll: {
+    maxHeight: 120,
+    marginTop: 2,
+  },
+  audioStatusText: {
+    color: '#666',
+    fontSize: 10,
+  },
+  copyLogButton: {
+    alignSelf: 'flex-end',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    marginTop: 2,
+    backgroundColor: '#333',
+    borderRadius: 4,
+  },
+  copyLogText: {
+    color: '#aaa',
+    fontSize: 10,
   },
   recordingRow: {
     flexDirection: 'row',

@@ -18,11 +18,13 @@ Hands-free voice interface for Claude Code — talk to Claude from your phone (o
 - Windows Firewall rule added for port 8787
 - `android:usesCleartextTraffic="true"` set in AndroidManifest (required for HTTP)
 - **BT remote** — Bluetooth shutter remote skip-forward button toggles mic; press to start listening, press again to stop + auto-send; screen-on wake lock; toggle in header (2026-03-24)
+- **BT headset mic** — records from Bluetooth motorcycle helmet mic via `BluetoothHeadset.startVoiceRecognition()` SCO activation; auto-falls back to phone mic if BT unavailable (2026-03-25)
 
 ### What's Next
 1. **Live partial transcripts** (future) — run Android SpeechRecognizer in parallel with Whisper for real-time feedback while speaking
 2. **Tailscale** — for remote/cellular access outside home WiFi
 3. **Screen-off mode** (future) — requires foreground service + raw audio capture
+4. **BT mic polish** — system voice assistant briefly appears when SCO activates via voice recognition; investigate suppressing it
 
 ### Previous Architecture (v1 — archived)
 The v1 app used Telegram Bot API as transport, which was fundamentally broken:
@@ -67,6 +69,8 @@ The v1 app used Telegram Bot API as transport, which was fundamentally broken:
 | `patches/` | patch-package patches (currently empty — voice library patches removed) |
 | `VOICE_PROMPT.md` | CLAUDE.md snippet to make Claude responses TTS-friendly |
 | `gemini_research.md` | Architecture research and analysis |
+| `BT_MIC_RESEARCH.md` | Problem statement for BT headset mic deep research |
+| `BT_MIC_Research_results.md` | Research results from Perplexity/Gemini/ChatGPT |
 | `archive/v1-telegram/` | Old Telegram-based app code |
 
 ## Tech Stack
@@ -103,8 +107,39 @@ Voice input uses a custom `AudioRecorderModule` native module to capture raw aud
 - Transcription typically takes 1–3 seconds for a 10–30 second clip
 
 **Native module files:**
-- `android/.../AudioRecorderModule.kt` — recording logic, WAV header writing, audio level events
+- `android/.../AudioRecorderModule.kt` — recording logic, BT SCO mic, WAV header writing, audio level events
 - `android/.../AudioRecorderPackage.kt` — ReactPackage registration
+
+## BT Headset Mic Details
+
+The app can record from a Bluetooth headset mic (e.g., motorcycle helmet headset) using `BluetoothHeadset.startVoiceRecognition()` to establish the SCO audio transport. This was the key breakthrough — standard APIs like `setCommunicationDevice()`, `startBluetoothSco()`, and `setPreferredDevice()` all failed on Samsung S24 Ultra because they only set routing preferences without opening the actual SCO link.
+
+**Flow:**
+1. `start()` runs on a background thread, calls `tryBluetoothVoiceRecognition()`
+2. Gets `BluetoothHeadset` profile proxy via `BluetoothAdapter.getProfileProxy()`
+3. Suspends RemoteButton MediaSession (must release audio focus for SCO)
+4. Registers `BroadcastReceiver` for `BluetoothHeadset.ACTION_AUDIO_STATE_CHANGED`
+5. Calls `headset.startVoiceRecognition(device)` — sends AT command to headset, triggers SCO
+6. Waits up to 5s for `STATE_AUDIO_CONNECTED` broadcast (state transitions: 10→11→12)
+7. If connected: sets `MODE_IN_COMMUNICATION`, creates `AudioRecord` with `VOICE_COMMUNICATION` source, starts silent `AudioTrack` for full-duplex hint, records via `READ_NON_BLOCKING`
+8. After 10 reads, verifies non-zero audio — falls back to phone mic if all zeros
+9. On stop: calls `stopVoiceRecognition()`, restores audio mode, resumes RemoteButton MediaSession
+
+**Why startVoiceRecognition works when other APIs don't:**
+- Android has 3 mutually exclusive SCO activation modes: Telecom call, virtual call, voice recognition
+- `startVoiceRecognition()` is a public API that explicitly establishes the SCO audio connection
+- It sends the Bluetooth voice recognition AT command to the headset, forcing the hardware link open
+- Standard routing APIs (`setCommunicationDevice`, `setPreferredDevice`) only set software preferences
+
+**Known quirk:** `startVoiceRecognition()` also activates the system voice assistant (Bixby/Google). It may briefly appear. We cannot call `stopVoiceRecognition()` before recording because it closes the SCO link. Called only at cleanup.
+
+**Key details:**
+- `MODIFY_AUDIO_SETTINGS` permission required in manifest
+- Silent `AudioTrack` with `USAGE_VOICE_COMMUNICATION` keeps full-duplex SCO stable
+- RemoteButton suspend/resume uses `runOnUiThread` (MediaSession requires main thread)
+- `READ_NON_BLOCKING` prevents app hangs when BT data isn't flowing
+- Emits `audioStatus` events for debug UI (visible in App.tsx status log)
+- See `BT_MIC_RESEARCH.md` and `BT_MIC_Research_results.md` for full research history
 
 ## BT Remote Details
 
